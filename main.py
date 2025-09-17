@@ -1,12 +1,15 @@
-# main.py — полный рабочий файл
+# main.py — Полный рабочий файл (готов к выкладке на хост)
+# Требуется: Python 3.9+, aiogram 3.x (примерно 3.0.0b7), asyncpg
+# Переменные окружения: BOT_TOKEN, DATABASE_URL
+# (OPTIONAL) можно добавить ADMIN_IDS в env как CSV, но по умолчанию ADMIN_IDS константа в коде.
+
 import os
-import io
-import json
-import asyncio
-import logging
-import re
-import tempfile
 import sys
+import re
+import json
+import tempfile
+import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -18,32 +21,35 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Надёжный импорт исключений (поддерживает разные версии aiogram)
+# Надёжный импорт исключений — разные версии aiogram могут не иметь конкретных классов
 try:
     from aiogram.exceptions import TelegramBadRequest, Forbidden
 except Exception:
     TelegramBadRequest = Exception
     Forbidden = Exception
 
-# ----------------- Конфигурация (через env) -----------------
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# -------------------- Конфигурация --------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# Админы оставлены в коде (можно вынести в env при необходимости)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# ADMIN_IDS: если нужно вынести в env, замените здесь на чтение os.environ.get("ADMIN_IDS")
+# Формат env: "123456,234567"
 ADMIN_IDS: List[int] = [1627227943]
 
+# Проверка env
 if not BOT_TOKEN or not DATABASE_URL:
-    print("ERROR: BOT_TOKEN and DATABASE_URL must be set in environment variables", file=sys.stderr)
-    raise RuntimeError("BOT_TOKEN and DATABASE_URL must be set")
+    print("ERROR: BOT_TOKEN and DATABASE_URL must be set in environment", file=sys.stderr)
+    raise RuntimeError("BOT_TOKEN and DATABASE_URL must be set in environment")
 
-# ----------------- Логирование -----------------
+# -------------------- Логирование --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ----------------- Aiogram init -----------------
+# -------------------- aiogram init --------------------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ----------------- FSM -----------------
+# -------------------- FSM states --------------------
 class S(StatesGroup):
     reg_wait_lang = State()
     reg_wait_channel = State()
@@ -60,12 +66,13 @@ class S(StatesGroup):
     admin_wait_mass_text = State()
     admin_wait_transfer = State()
 
-# ----------------- Локализация -----------------
-STRINGS = {
+# -------------------- Строки локализации --------------------
+# Важное: placeholder display используется для текста вида "Язык выбран: {display}"
+STRINGS: Dict[str, Dict[str, str]] = {
     "ru": {
         "start_welcome": "Добро пожаловать! Выберите язык:",
         "choose_lang": "Выберите язык:",
-        "lang_selected": "Язык выбран: {lang}. Теперь добавьте канал (перешлите сообщение из него или отправьте @username или ID). Админ может пропустить.",
+        "lang_selected": "Язык выбран: {display}. Теперь добавьте канал (перешлите сообщение из него или отправьте @username или ID). Админ может пропустить.",
         "ask_channel": "Добавьте бота в канал как администратора, затем перешлите сюда любое сообщение из канала или отправьте его @username или ID (например -100...).",
         "ask_channel_short": "Добавить канал",
         "send_message_text": "Отправьте текст сообщения (без форматирования).",
@@ -129,7 +136,7 @@ STRINGS = {
     "en": {
         "start_welcome": "Welcome! Choose language:",
         "choose_lang": "Choose language:",
-        "lang_selected": "Language selected: {lang}. Now add a channel (forward a message from it or send its @username or ID). Admins may skip.",
+        "lang_selected": "Language selected: {display}. Now add a channel (forward a message from it or send its @username or ID). Admins may skip.",
         "ask_channel": "Add the bot to the channel as admin, then forward any message from the channel here, or send its @username or ID (e.g. -100...).",
         "ask_channel_short": "Add channel",
         "send_message_text": "Send message text (plain).",
@@ -193,18 +200,39 @@ STRINGS = {
 }
 
 def tr(key: str, lang: str = "ru", **kwargs) -> str:
+    """
+    Получение строки локализации.
+    key - ключ в STRINGS
+    lang - 'ru' или 'en'
+    kwargs - параметры для форматирования строки
+    """
     if lang not in STRINGS:
         lang = "ru"
-    return STRINGS[lang].get(key, key).format(**kwargs)
+    t = STRINGS[lang].get(key, key)
+    try:
+        return t.format(**kwargs)
+    except Exception:
+        # Если форматирование упало — возвращаем шаблон без форматирования
+        return t
 
-# ----------------- DB pool -----------------
+# -------------------- DB pool --------------------
 db_pool: Optional[asyncpg.pool.Pool] = None
 
-# ----------------- Utility funcs -----------------
-def is_valid_url(u: str) -> bool:
+# -------------------- Утилиты --------------------
+def is_valid_url(u: Optional[str]) -> bool:
     if not u:
         return False
     return bool(re.match(r"^https?://", u.strip(), re.IGNORECASE))
+
+def normalize_chat_input(raw: str) -> str:
+    s = raw.strip()
+    if s.startswith("@"):
+        return s
+    try:
+        _ = int(s)
+        return s
+    except Exception:
+        return s
 
 async def safe_delete_message(msg: types.Message):
     try:
@@ -220,26 +248,16 @@ async def try_edit_or_send(chat_id: Optional[int], message_id: Optional[int], te
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
             return chat_id, message_id
         except Exception:
-            logger.debug("edit failed, will send new message")
+            logger.debug("edit failed, sending new message")
     sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     return sent.chat.id, sent.message_id
 
-def normalize_chat_input(raw: str) -> str:
-    s = raw.strip()
-    if s.startswith("@"):
-        return s
-    try:
-        _ = int(s)
-        return s
-    except Exception:
-        return s
-
-# ----------------- DB helpers -----------------
+# -------------------- DB helpers --------------------
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with db_pool.acquire() as conn:
-        # таблицы
+        # создание таблиц
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -394,7 +412,7 @@ async def incr_mailing_count():
             await conn.execute("UPDATE settings SET value=$1 WHERE key='mailing_count'", str(n))
             return n
 
-# ----------------- Scheduler -----------------
+# -------------------- Scheduler --------------------
 async def schedule_pending_on_startup():
     rows = await get_pending_tasks()
     now = datetime.utcnow()
@@ -420,11 +438,14 @@ async def apply_modifier(mailing_id: int, modifier_type: str):
     msg_id = m["message_id"]
     kb = None
     if buttons:
-        kb = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text=b["text"], url=b["url"])] for b in buttons if is_valid_url(b.get("url"))])
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text=b["text"], url=b["url"])] for b in buttons if is_valid_url(b.get("url"))]
+        )
     try:
         if modifier_type == "unpin":
             try:
-                await bot.unpin_chat_message(chat_id=ch_id, message_id=msg_id)
+                if msg_id:
+                    await bot.unpin_chat_message(chat_id=ch_id, message_id=msg_id)
             except Exception:
                 try:
                     await bot.unpin_all_chat_messages(chat_id=ch_id)
@@ -485,7 +506,7 @@ async def apply_modifier(mailing_id: int, modifier_type: str):
     except Exception:
         logger.exception("apply_modifier overall")
 
-# ----------------- Middlewares -----------------
+# -------------------- Middlewares --------------------
 @dp.message.middleware()
 async def mw_last_seen(handler, event: types.Message, data):
     if isinstance(event, types.Message):
@@ -497,7 +518,7 @@ async def mw_last_seen(handler, event: types.Message, data):
             logger.exception("mw_last_seen")
     return await handler(event, data)
 
-# ----------------- Keyboards -----------------
+# -------------------- Keyboards --------------------
 async def keyboard_main(uid: int) -> types.InlineKeyboardMarkup:
     acc = await get_account(uid)
     lang = acc["lang"] if acc else "ru"
@@ -519,7 +540,7 @@ async def keyboard_main(uid: int) -> types.InlineKeyboardMarkup:
 def back_button_row(lang: str):
     return [types.InlineKeyboardButton(text=tr("back", lang), callback_data="back_to_main")]
 
-# ----------------- Handlers -----------------
+# -------------------- Handlers (основные) --------------------
 @dp.message(Command("start"))
 async def cmd_start(m: types.Message, state: FSMContext):
     await ensure_account(m.from_user.id)
@@ -528,7 +549,6 @@ async def cmd_start(m: types.Message, state: FSMContext):
         await m.answer(tr("blocked_notice", acc["lang"]))
         await safe_delete_message(m)
         return
-    # если пользователь без языка — предлагаем выбор
     if not acc or not acc["lang"]:
         kb = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text=STRINGS["ru"]["lang_ru"], callback_data="lang:ru")],
@@ -563,12 +583,13 @@ async def cb_lang(c: types.CallbackQuery, state: FSMContext):
     await ensure_account(c.from_user.id)
     await set_lang(c.from_user.id, lang)
     display = STRINGS[lang]["lang_ru"] if lang == "ru" else STRINGS[lang]["lang_en"]
+    # Используем display именованно
     try:
-        await c.message.edit_text(tr("lang_selected", lang, lang=display))
+        await c.message.edit_text(tr("lang_selected", lang, display=display))
         await c.message.edit_reply_markup(None)
         await state.update_data(bot_msg_chat=c.message.chat.id, bot_msg_id=c.message.message_id)
     except Exception:
-        await c.message.answer(tr("lang_selected", lang, lang=display))
+        await c.message.answer(tr("lang_selected", lang, display=display))
     try:
         await bot.send_message(chat_id=c.message.chat.id, text=tr("ask_channel", lang))
     except Exception:
@@ -696,7 +717,7 @@ async def cb_create_mailing(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(S.waiting_for_text)
 async def msg_mailing_text(m: types.Message, state: FSMContext):
-    await state.update_data(message_text=m.text)
+    await state.update_data(message_text=m.text or "")
     acc = await get_account(m.from_user.id)
     lang = acc["lang"] if acc else "ru"
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -732,7 +753,7 @@ async def cb_add_buttons(c: types.CallbackQuery):
 
 @dp.message(S.waiting_for_buttons)
 async def msg_buttons(m: types.Message, state: FSMContext):
-    lines = [l.strip() for l in m.text.splitlines() if l.strip()]
+    lines = [l.strip() for l in (m.text or "").splitlines() if l.strip()]
     buttons: List[Dict[str,str]] = []
     invalid: List[str] = []
     for ln in lines:
@@ -810,14 +831,14 @@ async def msg_modifier_time(m: types.Message, state: FSMContext):
         return
     if mod == "replace_text":
         mods = data.get("modifiers", {})
-        mods["replace_text_new"] = m.text
+        mods["replace_text_new"] = m.text or ""
         await state.update_data(modifiers=mods)
         await m.answer(tr("mod_added", lang, m=mod, minutes="(text set)"))
         await safe_delete_message(m)
         await state.set_state(S.waiting_for_modifiers)
         return
     try:
-        minutes = int(m.text.strip())
+        minutes = int((m.text or "0").strip())
         if minutes < 0:
             raise ValueError()
     except Exception:
@@ -1053,7 +1074,7 @@ async def cb_back(c: types.CallbackQuery):
     except Exception:
         await c.message.answer(tr("main_menu", lang), reply_markup=kb)
 
-# ----------------- Admin panel -----------------
+# -------------------- Admin panel --------------------
 @dp.callback_query(lambda c: c.data == "admin_panel")
 async def cb_admin(c: types.CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
@@ -1341,7 +1362,32 @@ async def msg_admin_transfer(m: types.Message, state: FSMContext):
     await m.answer(tr("owner_changed", "ru", nid=nid))
     await state.clear()
 
-# ----------------- Periodic cleanup/startup -----------------
+# -------------------- Utility debug handler --------------------
+@dp.message(Command("check_chat"))
+async def cmd_check_chat(m: types.Message):
+    # Usage: /check_chat <chat_id_or_username>
+    args = (m.text or "").split()
+    if len(args) < 2:
+        await m.reply("Usage: /check_chat <chat_id_or_username>")
+        return
+    target = args[1].strip()
+    try:
+        info = await bot.get_chat(target)
+        me = await bot.get_me()
+        try:
+            member = await bot.get_chat_member(chat_id=target, user_id=me.id)
+            text = f"Chat: {getattr(info,'title',info.id)}\nBot status: {member.status}\n"
+            # some chat member objects have specific rights attributes
+            for attr in ("can_post_messages","can_edit_messages","can_change_info","can_pin_messages","can_delete_messages"):
+                val = getattr(member, attr, None)
+                text += f"{attr}: {val}\n"
+            await m.reply(text)
+        except Exception as e2:
+            await m.reply(f"Chat info obtained but cannot get bot member info: {e2}")
+    except Exception as e:
+        await m.reply(f"Error get_chat: {e}")
+
+# -------------------- Startup / Cleanup --------------------
 async def periodic_cleanup_task():
     while True:
         try:
@@ -1355,7 +1401,6 @@ async def on_startup():
     await schedule_pending_on_startup()
     asyncio.create_task(periodic_cleanup_task())
 
-# ----------------- Run -----------------
 async def main():
     await on_startup()
     await dp.start_polling(bot)
